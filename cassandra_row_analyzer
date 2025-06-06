@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+
+import subprocess
+import getpass
+import statistics
+import math
+from cassandra.cluster import Cluster
+from cassandra.auth import PlainTextAuthProvider
+from cassandra.query import SimpleStatement
+from cassandra.cqltypes import BlobType
+
+# --- Helper function for logging ---
+def log_and_print(message, file_handle):
+    """Prints a message to the console and writes it to a log file."""
+    print(message)
+    file_handle.write(message + '\n')
+
+def get_local_ip():
+    """Gets the primary local IP address of the host."""
+    try:
+        # Run 'hostname -I' and get the first IP address
+        result = subprocess.run(['hostname', '-I'], capture_output=True, text=True, check=True)
+        return result.stdout.strip().split()[0]
+    except (subprocess.CalledProcessError, FileNotFoundError, IndexError) as e:
+        # This error will be handled by the main function's logger
+        raise IOError(f"Error getting local IP address: {e}. Please ensure 'hostname -I' is available or set the IP manually.")
+
+def analyze_cassandra_row_sizes():
+    """
+    Connects to a Cassandra cluster and provides row size estimates for each table,
+    logging all output to a file.
+    """
+    LOG_FILE = 'row_size_analyzer_output.txt'
+    
+    with open(LOG_FILE, 'w') as f:
+        try:
+            # --- Configuration ---
+            SAMPLE_SIZE = 30000
+            CONSISTENCY_LEVEL = 'LOCAL_ONE'
+            SYSTEM_KEYSPACES = [
+                'system', 'system_schema', 'system_traces', 'system_auth', 'system_distributed',
+                'system_views', 'dse_auth', 'dse_security', 'dse_leases', 'dse_perf', 
+                'dse_system', 'dsefs', 'solr_admin', 'opscenter', 'cfs', 'cfs_archive', 
+                'hivemetastore', 'spark_system'
+            ]
+
+            # --- Get Connection Details ---
+            host_ip = get_local_ip()
+            
+            log_and_print("--- Cassandra Row Size Sampler ---", f)
+            username = input(f"Enter username for Cassandra host {host_ip}: ")
+            password = getpass.getpass("Enter password: ")
+
+            auth_provider = PlainTextAuthProvider(username=username, password=password)
+            
+            cluster = None
+            try:
+                # --- Connect to Cassandra ---
+                cluster = Cluster([host_ip], auth_provider=auth_provider)
+                session = cluster.connect()
+                log_and_print("\nSuccessfully connected to Cassandra cluster.", f)
+
+                # --- Discover Keyspaces and Tables ---
+                keyspaces = [ks for ks in cluster.metadata.keyspaces if ks not in SYSTEM_KEYSPACES]
+                
+                log_and_print(f"Found {len(keyspaces)} user keyspace(s) to analyze...", f)
+
+                for ks_name in keyspaces:
+                    log_and_print(f"\n--- Analyzing Keyspace: {ks_name} ---", f)
+                    for table_name, table_metadata in cluster.metadata.keyspaces[ks_name].tables.items():
+                        
+                        # --- Analyze Table Structure ---
+                        has_blob = any(isinstance(col.type, BlobType) for col in table_metadata.columns.values())
+                        has_static = any(col.is_static for col in table_metadata.columns.values())
+                        has_default_ttl = table_metadata.options.get('default_time_to_live', 0) == 0
+
+                        # --- Sample Data and Calculate Sizes ---
+                        row_sizes = []
+                        try:
+                            query = SimpleStatement(
+                                f'SELECT * FROM "{ks_name}"."{table_name}" LIMIT {SAMPLE_SIZE}',
+                                consistency_level=cluster.consistency_level_from_string(CONSISTENCY_LEVEL)
+                            )
+                            rows = session.execute(query, timeout=60.0)
+
+                            for row in rows:
+                                size = 0
+                                for col_name in row.column_names:
+                                    value = getattr(row, col_name)
+                                    if value is not None:
+                                        if isinstance(value, bytes): # Handle blobs
+                                            size += len(value) * 2 # Multiply by 2 to approximate hex string length
+                                        else:
+                                            size += len(str(value))
+                                row_sizes.append(size)
+                        
+                        except Exception as e:
+                            log_and_print(f"Could not sample table {ks_name}.{table_name}. Error: {e}", f)
+                            continue
+
+                        # --- Calculate Statistics ---
+                        if not row_sizes:
+                            log_and_print(f"Table {ks_name}.{table_name} has no data to sample.", f)
+                            continue
+
+                        num_samples = len(row_sizes)
+                        num_columns = len(table_metadata.columns)
+                        avg_size = statistics.mean(row_sizes)
+                        max_size = max(row_sizes)
+                        min_size = min(row_sizes)
+                        
+                        stdev = 0
+                        if num_samples > 1:
+                            stdev = statistics.stdev(row_sizes)
+
+                        # --- Print Formatted Output ---
+                        output = (
+                            f"{ks_name}.{table_name} = {{ "
+                            f"lines: {num_samples}, "
+                            f"columns: {num_columns}, "
+                            f"average: {avg_size:.0f} bytes, "
+                            f"stdev: {stdev:.0f} bytes, "
+                            f"min: {min_size} bytes, "
+                            f"max: {max_size} bytes, "
+                            f"blob: {'y' if has_blob else 'n'}, "
+                            f"default-ttl: {'y' if has_default_ttl else 'n'}, "
+                            f"static: {'y' if has_static else 'n'}"
+                            f" }}"
+                        )
+                        log_and_print(output, f)
+
+            except Exception as e:
+                log_and_print(f"\nAn error occurred during Cassandra operations: {e}", f)
+                log_and_print("Please check your connection details, credentials, and permissions.", f)
+            finally:
+                if cluster:
+                    cluster.shutdown()
+                    log_and_print("\nConnection closed. Fin!", f)
+
+        except Exception as e:
+            # Catch errors from get_local_ip or initial input
+            log_and_print(f"A critical error occurred: {e}", f)
+
+if __name__ == "__main__":
+    analyze_cassandra_row_sizes()
